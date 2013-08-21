@@ -11,12 +11,10 @@
 # You should have received a copy of GPLv2 along with this software;
 # if not, see http://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
 
-# first, so that all subsequently imported modules are the monkey patched versions
-import eventlet
-eventlet.monkey_patch(thread=False)
-
 import datetime
 import httplib
+import Queue
+import threading
 import time
 import urllib
 import urlparse
@@ -72,21 +70,88 @@ class HTTPEventletRequestsDownloader(Downloader):
         seconds = self.config.progress_interval or DEFAULT_PROGRESS_INTERVAL
         return datetime.timedelta(seconds=seconds)
 
+    def progress_reporter(self, queue):
+        """
+        Useful in a thread to fire reports. See below for the sentinal value that
+        signals the thread to end.
+
+        :param queue:   queue that will contain tuples where the first member
+                        is a DownloadReport, and the second member is a function
+                        to call with that report. The function should handle
+                        the firing of that report. If the first member is anything
+                        besides a DownloadReport, this function will return.
+        :type  queue:   Queue.Queue
+        """
+        while True:
+            report, report_func = queue.get()
+            if not isinstance(report, DownloadReport):
+                # done!
+                break
+            report_func(report)
+            queue.task_done()
+
+    def worker(self, queue, queue_ready, session, report_queue):
+        """
+        :param queue:       queue of DownloadRequest instances
+        :type  queue:       Queue.Queue
+        :param queue_ready: threading event that signals when the queue has been
+                            sufficiently populated that it is ready for workers
+                            to start
+        :type  queue_ready: threading.Event
+        :param session:     Session instance
+        :type  session:     requests.sessions.Session
+        :param report_queue:queue where DownloadReport instances can be dropped
+                            for reporting. Each item added should be a tuple
+                            with the first member a DownloadReport instance, and
+                            the second member a function to call with that report
+        :type  report_queue:Queue.Queue
+
+        """
+        queue_ready.wait()
+        while not self.is_canceled:
+            try:
+                request = queue.get_nowait()
+            except Queue.Empty:
+                break
+            self._fetch(request, session, report_queue)
+            queue.task_done()
+
+    def feed_queue(self, queue, queue_ready, request_list):
+        """
+        takes DownloadRequests off of an iterator (which could be a generator),
+        and adds them to a queue. This is only useful if the queue has a size
+        limit. Sets queue_ready when the queue is full enough for workers to start.
+        """
+        for request in request_list:
+            if self.is_canceled:
+                break
+            queue.put(request)
+            if queue.full() and not queue_ready.is_set():
+                queue_ready.set()
+        # call again in case we never filled up the queue
+        if not queue_ready.is_set():
+            queue_ready.set()
+
     def download(self, request_list):
-
-        pool = eventlet.GreenPool(size=self.max_concurrent)
         session = build_session(self.config)
+        queue = Queue.Queue(maxsize=self.max_concurrent*3)
+        queue_ready = threading.Event()
+        report_queue = Queue.Queue()
+        _LOG.debug('starting feed queue thread')
+        feeder = threading.Thread(target=self.feed_queue, args=[queue, queue_ready, request_list])
+        threading.Thread(target=self.progress_reporter, args=[report_queue]).start()
 
-        def _session_generator():
-            while True: yield session
+        _LOG.debug('starting workers')
+        for i in range(self.max_concurrent):
+            threading.Thread(target=self.worker, args=[queue, queue_ready, session, report_queue]).start()
 
-        for report in pool.imap(self._fetch, request_list, _session_generator()):
+        feeder.start()
+        feeder.join()
 
-            if report.state is DOWNLOAD_SUCCEEDED:
-                self.fire_download_succeeded(report)
-
-            else: # DOWNLOAD_FAILED
-                self.fire_download_failed(report)
+        queue.join()
+        report_queue.join()
+        report_queue.put((True, None))
+        session.close()
 
     @staticmethod
     def chunk_generator(raw, chunk_size):
@@ -108,7 +173,7 @@ class HTTPEventletRequestsDownloader(Downloader):
                 break
             yield chunk
 
-    def _fetch(self, request, session):
+    def _fetch(self, request, session, report_queue):
         """
         :param request: download request object with details about what to
                         download and where to put it
@@ -139,7 +204,7 @@ class HTTPEventletRequestsDownloader(Downloader):
 
         report = DownloadReport.from_download_request(request)
         report.download_started()
-        self.fire_download_started(report)
+        report_queue.put((report, self.fire_download_started))
 
         try:
             if self.is_canceled:
@@ -154,7 +219,7 @@ class HTTPEventletRequestsDownloader(Downloader):
             file_handle = request.initialize_file_handle()
 
             last_update_time = datetime.datetime.now()
-            self.fire_download_progress(report) # guarantee 1 report at the beginning
+            report_queue.put((report, self.fire_download_progress))
 
             if ignore_encoding:
                 chunks = self.chunk_generator(response.raw, self.buffer_size)
@@ -174,13 +239,13 @@ class HTTPEventletRequestsDownloader(Downloader):
 
                 if now - last_update_time >= progress_interval:
                     last_update_time = now
-                    self.fire_download_progress(report)
+                    report_queue.put((report, self.fire_download_progress))
 
-                if now - session.nectar_time_bytes_this_second_was_cleared >= ONE_SECOND:
-                    session.nectar_bytes_this_second = 0
-                    session.nectar_time_bytes_this_second_was_cleared = now
-
-                session.nectar_bytes_this_second += bytes_read
+                with session.nectar_bytes_lock:
+                    if now - session.nectar_time_bytes_this_second_was_cleared >= ONE_SECOND:
+                        session.nectar_bytes_this_second = 0
+                        session.nectar_time_bytes_this_second_was_cleared = now
+                    session.nectar_bytes_this_second += bytes_read
 
                 if max_speed is not None and session.nectar_bytes_this_second >= max_speed:
                     # it's not worth doing fancier mathematics than this, very
@@ -189,7 +254,8 @@ class HTTPEventletRequestsDownloader(Downloader):
                     # before this second is up
                     time.sleep(0.5)
 
-            self.fire_download_progress(report) # guarantee 1 report at the end
+            # guarantee 1 report at the end
+            report_queue.put((report, self.fire_download_progress))
 
         except DownloadCancelled, e:
             _LOG.debug(str(e))
@@ -213,7 +279,10 @@ class HTTPEventletRequestsDownloader(Downloader):
         finally:
             request.finalize_file_handle()
 
-        return report
+        if report.state is DOWNLOAD_SUCCEEDED:
+            report_queue.put((report, self.fire_download_succeeded))
+        else: # DOWNLOAD_FAILED
+            report_queue.put((report, self.fire_download_failed))
 
 # -- requests utilities --------------------------------------------------------
 
@@ -225,6 +294,7 @@ def build_session(config):
     _add_proxy(session, config)
     session.nectar_bytes_this_second = 0
     session.nectar_time_bytes_this_second_was_cleared = datetime.datetime.now()
+    session.nectar_bytes_lock = threading.Lock()
 
     return session
 
